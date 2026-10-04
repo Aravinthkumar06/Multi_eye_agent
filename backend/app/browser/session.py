@@ -71,7 +71,7 @@ class BrowserSession:
                     type="jpeg",
                     quality=_SCREENSHOT_QUALITY,
                     full_page=False,
-                    animations="disabled",
+                    
                     timeout=5000,
                 )
 
