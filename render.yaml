@@ -16,6 +16,8 @@ services:
     envVars:
       - key: VITE_API_URL
         value: https://multiview-agent-backend.onrender.com
+      - key: VITE_WS_URL
+        value: wss://multiview-agent-backend.onrender.com/ws
     routes:
       - type: rewrite
         source: /*

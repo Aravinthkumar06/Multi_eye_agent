@@ -1,10 +1,14 @@
 from enum import Enum
 from pydantic import BaseModel
-from typing import Optional
 import datetime
 import asyncio
-import time
+from contextlib import suppress
+from typing import Optional
+
 from playwright.async_api import Page, BrowserContext
+
+from app.websocket.manager import websocket_manager
+
 
 class SessionStatus(str, Enum):
     STARTING = "STARTING"
@@ -16,6 +20,7 @@ class SessionStatus(str, Enum):
     ERROR = "ERROR"
     CRASHED = "CRASHED"
 
+
 class BrowserSessionInfo(BaseModel):
     session_id: str
     status: SessionStatus
@@ -24,11 +29,14 @@ class BrowserSessionInfo(BaseModel):
     creation_time: str
     last_activity: str
 
-from app.websocket.manager import websocket_manager
 
-# Target FPS per session for the screencast feed
-_TARGET_FPS = 10
-_FRAME_INTERVAL = 1.0 / _TARGET_FPS
+# Playwright screenshots are used instead of Page.startScreencast/CDP.  This is
+# more reliable on Render's headless Chromium and keeps the frontend protocol
+# unchanged: [4-byte session-id length][session-id][JPEG bytes].
+_FRAME_INTERVAL = 0.20  # ~5 FPS per browser
+_SCREENSHOT_QUALITY = 50
+_SCREENSHOT_WIDTH = 640
+_SCREENSHOT_HEIGHT = 360
 
 
 class BrowserSession:
@@ -41,73 +49,46 @@ class BrowserSession:
         self.last_activity = self.creation_time
         self.current_url = "about:blank"
         self.title = ""
-        self.cdp_session = None
-        self._last_frame_time: float = 0.0
+        self._screenshot_task: Optional[asyncio.Task] = None
+        self._closed = False
 
     async def initialize(self):
         self.status = SessionStatus.RUNNING
         self.page.on("framenavigated", self._on_navigate)
-        await self._start_screencast()
+        self._start_screenshot_loop()
 
-    async def _start_screencast(self):
-        """Start (or restart) the CDP screencast for this session."""
-        try:
-            # Stop and detach old CDP session if it exists
-            if self.cdp_session:
-                try:
-                    await self.cdp_session.send("Page.stopScreencast")
-                except Exception:
-                    pass
-                try:
-                    await self.cdp_session.detach()
-                except Exception:
-                    pass
-                self.cdp_session = None
-
-            self.cdp_session = await self.context.new_cdp_session(self.page)
-            self.cdp_session.on("Page.screencastFrame", self._on_screencast_frame)
-            await self.cdp_session.send("Page.startScreencast", {
-                "format": "jpeg",
-                "quality": 50,        # reduced for speed
-                "maxWidth": 640,      # smaller = faster to encode + transmit
-                "maxHeight": 360,
-                "everyNthFrame": 2    # request every 2nd frame (~15fps source → ~7.5fps)
-            })
-        except Exception as e:
-            print(f"Failed to start CDP screencast for {self.session_id}: {e}")
-
-    async def _on_screencast_frame(self, event):
-        """Receive a CDP screencast frame, throttle it, and broadcast via WebSocket."""
-        # Throttle: drop frames faster than target FPS
-        now = time.monotonic()
-        if now - self._last_frame_time < _FRAME_INTERVAL:
-            # Still ack so Chrome doesn't stall
-            if self.cdp_session:
-                try:
-                    await self.cdp_session.send("Page.screencastFrameAck", {"sessionId": event["sessionId"]})
-                except Exception:
-                    pass
+    def _start_screenshot_loop(self):
+        if self._screenshot_task and not self._screenshot_task.done():
             return
+        self._screenshot_task = asyncio.create_task(self._screenshot_loop())
 
-        self._last_frame_time = now
-
-        # Ack frame
-        if self.cdp_session:
+    async def _screenshot_loop(self):
+        """Continuously capture the page and broadcast JPEG frames over WS."""
+        while not self._closed:
             try:
-                await self.cdp_session.send("Page.screencastFrameAck", {"sessionId": event["sessionId"]})
-            except Exception:
-                pass
+                # Capture at a bounded size to keep Render CPU/network usage sane.
+                jpeg_bytes = await self.page.screenshot(
+                    type="jpeg",
+                    quality=_SCREENSHOT_QUALITY,
+                    full_page=False,
+                    animations="disabled",
+                    timeout=5000,
+                )
 
-        # Broadcast binary frame (session_id + raw JPEG bytes)
-        import base64
-        try:
-            jpeg_bytes = base64.b64decode(event["data"])
-            sid_bytes = self.session_id.encode("utf-8")
-            sid_len = len(sid_bytes).to_bytes(4, "big")
-            payload = sid_len + sid_bytes + jpeg_bytes
-            asyncio.create_task(websocket_manager.broadcast_binary(payload))
-        except Exception as e:
-            print(f"Frame broadcast error for {self.session_id}: {e}")
+                sid_bytes = self.session_id.encode("utf-8")
+                payload = (
+                    len(sid_bytes).to_bytes(4, "big")
+                    + sid_bytes
+                    + jpeg_bytes
+                )
+                await websocket_manager.broadcast_binary(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Navigation can briefly invalidate a screenshot. Keep the loop alive.
+                if not self._closed:
+                    print(f"Screenshot frame notice for {self.session_id}: {e}")
+            await asyncio.sleep(_FRAME_INTERVAL)
 
     async def _on_navigate(self, frame):
         if frame == self.page.main_frame:
@@ -141,23 +122,22 @@ class BrowserSession:
                 self.current_url = self.page.url
         finally:
             self.update_activity()
-            # Restart screencast so the new document's frames come through
-            asyncio.create_task(self._start_screencast())
+            self._start_screenshot_loop()
 
     async def reload(self):
         await self.page.reload(wait_until="commit")
         self.update_activity()
-        asyncio.create_task(self._start_screencast())
+        self._start_screenshot_loop()
 
     async def back(self):
         await self.page.go_back(wait_until="commit")
         self.update_activity()
-        asyncio.create_task(self._start_screencast())
+        self._start_screenshot_loop()
 
     async def forward(self):
         await self.page.go_forward(wait_until="commit")
         self.update_activity()
-        asyncio.create_task(self._start_screencast())
+        self._start_screenshot_loop()
 
     async def stop_loading(self):
         await self.page.evaluate("window.stop()")
@@ -165,16 +145,14 @@ class BrowserSession:
 
     async def close(self):
         self.status = SessionStatus.STOPPING
-        if self.cdp_session:
-            try:
-                await self.cdp_session.send("Page.stopScreencast")
-            except Exception:
-                pass
-            try:
-                await self.cdp_session.detach()
-            except Exception:
-                pass
-            self.cdp_session = None
+        self._closed = True
+
+        if self._screenshot_task:
+            self._screenshot_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._screenshot_task
+            self._screenshot_task = None
+
         await self.page.close()
         await self.context.close()
         self.status = SessionStatus.STOPPED
@@ -186,5 +164,5 @@ class BrowserSession:
             current_url=self.current_url,
             title=self.title,
             creation_time=self.creation_time.isoformat(),
-            last_activity=self.last_activity.isoformat()
+            last_activity=self.last_activity.isoformat(),
         )

@@ -1,66 +1,87 @@
-// API service layer — all backend calls go through here
+// API service layer — all backend calls go through here.
 import type { BrowserSession } from '../types';
 
-const API_BASE = `http://${window.location.hostname}:8000`;
-export const WS_URL = `ws://${window.location.hostname}:8000/ws`;
+const stripTrailingSlash = (value: string) => value.replace(/\/+$/, '');
+
+// Render supplies these at build time. The local fallbacks keep `npm run dev`
+// working when the frontend is run locally alongside the FastAPI server.
+const API_BASE = stripTrailingSlash(
+  import.meta.env.VITE_API_URL || `http://${window.location.hostname}:8000`,
+);
+
+export const WS_URL =
+  import.meta.env.VITE_WS_URL ||
+  `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8000/ws`;
+
+async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
+  const response = await fetch(input, init);
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const body = await response.json();
+      detail = body?.detail ? `: ${body.detail}` : '';
+    } catch {
+      // Ignore non-JSON error bodies.
+    }
+    throw new Error(`Request failed (${response.status})${detail}`);
+  }
+  return response.json() as Promise<T>;
+}
 
 export const api = {
-  health: () =>
-    fetch(`${API_BASE}/health`).then(r => r.json()),
+  health: () => requestJson<{ status: string }>(`${API_BASE}/health`),
 
   browsers: {
     list: (): Promise<BrowserSession[]> =>
-      fetch(`${API_BASE}/api/browsers`).then(r => r.json()),
+      requestJson<BrowserSession[]>(`${API_BASE}/api/browsers`),
 
     create: (): Promise<BrowserSession> =>
-      fetch(`${API_BASE}/api/browsers`, { method: 'POST' }).then(r => {
-        if (!r.ok) throw new Error(`Failed to create browser (${r.status})`);
-        return r.json();
-      }),
+      requestJson<BrowserSession>(`${API_BASE}/api/browsers`, { method: 'POST' }),
 
     createBatch: (count: number): Promise<BrowserSession[]> =>
-      fetch(`${API_BASE}/api/browsers/batch/create`, {
+      requestJson<BrowserSession[]>(`${API_BASE}/api/browsers/batch/create`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ count }),
-      }).then(r => {
-        if (!r.ok) throw new Error(`Failed to batch create browsers (${r.status})`);
-        return r.json();
       }),
 
     close: (id: string) =>
-      fetch(`${API_BASE}/api/browsers/${id}`, { method: 'DELETE' }).then(r => r.json()),
+      requestJson<{ status: string }>(`${API_BASE}/api/browsers/${id}`, { method: 'DELETE' }),
 
     navigate: (id: string, url: string): Promise<BrowserSession> =>
-      fetch(`${API_BASE}/api/browsers/${id}/navigate`, {
+      requestJson<BrowserSession>(`${API_BASE}/api/browsers/${id}/navigate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url.startsWith('http') ? url : `https://${url}` }),
-      }).then(r => r.json()),
+      }),
 
     reload: (id: string) =>
-      fetch(`${API_BASE}/api/browsers/${id}/reload`, { method: 'POST' }).then(r => r.json()),
+      requestJson<BrowserSession>(`${API_BASE}/api/browsers/${id}/reload`, { method: 'POST' }),
 
     back: (id: string) =>
-      fetch(`${API_BASE}/api/browsers/${id}/back`, { method: 'POST' }).then(r => r.json()),
+      requestJson<BrowserSession>(`${API_BASE}/api/browsers/${id}/back`, { method: 'POST' }),
 
     forward: (id: string) =>
-      fetch(`${API_BASE}/api/browsers/${id}/forward`, { method: 'POST' }).then(r => r.json()),
+      requestJson<BrowserSession>(`${API_BASE}/api/browsers/${id}/forward`, { method: 'POST' }),
 
     stop: (id: string) =>
-      fetch(`${API_BASE}/api/browsers/${id}/stop`, { method: 'POST' }).then(r => r.json()),
+      requestJson<BrowserSession>(`${API_BASE}/api/browsers/${id}/stop`, { method: 'POST' }),
 
     navigateAll: (url: string) =>
-      fetch(`${API_BASE}/api/browsers/batch/navigate-all`, {
+      requestJson<{ status: string; count: number }>(`${API_BASE}/api/browsers/batch/navigate-all`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url.startsWith('http') ? url : `https://${url}` }),
-      }).then(r => r.json()),
+      }),
 
     reloadAll: () =>
-      fetch(`${API_BASE}/api/browsers/batch/reload-all`, { method: 'POST' }).then(r => r.json()),
+      requestJson<{ status: string; count: number }>(`${API_BASE}/api/browsers/batch/reload-all`, {
+        method: 'POST',
+      }),
 
     stopAll: () =>
-      fetch(`${API_BASE}/api/browsers/batch/stop-all`, { method: 'POST' }).then(r => r.json()),
+      requestJson<{ status: string; count: number }>(`${API_BASE}/api/browsers/batch/stop-all`, {
+        method: 'POST',
+      }),
   },
 };

@@ -49,8 +49,8 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
             logger.info(f"Received from client: {data}")
     except WebSocketDisconnect:
-        websocket_manager.disconnect(websocket)
+        await websocket_manager.disconnect(websocket)
         logger.info("WebSocket disconnected")
     except Exception as e:
-        websocket_manager.disconnect(websocket)
+        await websocket_manager.disconnect(websocket)
         logger.error(f"WebSocket error: {e}")
